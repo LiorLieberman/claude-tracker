@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Claude chats</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #141518; --panel: #1c1e22; --line: #2b2e34; --text: #e4e5e7; --dim: #8a8f98;
+    --red: #e5534b; --amber: #d9a441; --mark: #4d3f12;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 28px 24px 60px; }
+  header { display: flex; align-items: center; gap: 16px; }
+  h1 { margin: 0; font-size: 18px; font-weight: 600; white-space: nowrap; }
+  #q { flex: 1; padding: 9px 12px; font: inherit; color: var(--text); background: var(--panel);
+       border: 1px solid var(--line); border-radius: 8px; outline: none; }
+  #q:focus { border-color: var(--dim); }
+  #banner { margin: 16px 0 0; padding: 8px 12px; color: var(--amber);
+            border: 1px solid var(--amber); border-radius: 8px; }
+  h2 { display: inline-block; margin: 26px 0 8px; font-size: 12px; font-weight: 600;
+       letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
+  summary { cursor: pointer; color: var(--dim); }
+  .row { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; padding: 10px 12px;
+         background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  .row.overdue { border-color: var(--red); }
+  .body { flex: 1; min-width: 0; }
+  .title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: pointer; }
+  .title:hover { text-decoration: underline; }
+  .rename { width: 100%; padding: 2px 6px; font: inherit; color: var(--text); background: var(--bg);
+            border: 1px solid var(--dim); border-radius: 4px; outline: none; }
+  .meta, .snippet { margin-top: 2px; font-size: 12px; color: var(--dim); }
+  .snippet { margin-top: 4px; }
+  mark { background: var(--mark); color: inherit; border-radius: 2px; }
+  .idle { min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
+  .overdue .idle { color: var(--red); font-weight: 600; }
+  .actions { display: flex; gap: 6px; }
+  button { padding: 4px 10px; font: inherit; font-size: 12px; color: var(--text); background: none;
+           border: 1px solid var(--line); border-radius: 6px; cursor: pointer; white-space: nowrap; }
+  button:hover { border-color: var(--dim); }
+  .empty { padding: 0 0 8px; color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Claude chats</h1>
+    <input id="q" type="search" placeholder="Search titles, projects and messages   ( / )" autocomplete="off" autofocus>
+  </header>
+  <div id="banner" hidden></div>
+  <div id="list"></div>
+</main>
+<script>
+const q = document.getElementById("q");
+const list = document.getElementById("list");
+const banner = document.getElementById("banner");
+const folded = { "Acknowledged": true, "Done": true };  // kept across refreshes
+let words = [];
+let typing;
+let editing = false;  // refreshes would wipe a half-typed rename
+
+function ago(seconds) {
+  const m = Math.floor(seconds / 60);
+  if (m < 1) return "now";
+  if (m < 60) return m + "m";
+  const h = Math.floor(m / 60);
+  return h < 48 ? h + "h" : Math.floor(h / 24) + "d";
+}
+
+function el(tag, props, ...kids) {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...kids);
+  return node;
+}
+
+// Wraps the search words in <mark> without going through innerHTML.
+function highlighted(text) {
+  const span = el("span");
+  if (!words.length) {
+    span.textContent = text;
+    return span;
+  }
+  const re = new RegExp("(" + words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")", "gi");
+  text.split(re).forEach((part, i) => span.append(i % 2 ? el("mark", { textContent: part }) : part));
+  return span;
+}
+
+function state(s) {
+  if (s.status === "acked") return "acknowledged";
+  if (s.status === "done") return "done";
+  if (s.turn === "you") return "your turn";
+  return s.needs_you ? "Claude quiet for an hour: stuck or interrupted?" : "Claude working";
+}
+
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function setStatus(id, status) {
+  await post("/api/status", { id, status });
+  load();
+}
+
+function row(s) {
+  const actions = el("div", { className: "actions" });
+  const add = (label, onclick) => actions.append(el("button", { textContent: label, onclick }));
+  if (s.status !== "acked") add("Ack", () => setStatus(s.id, "acked"));
+  if (s.status !== "done") add("Done", () => setStatus(s.id, "done"));
+  if (s.status !== "active") add("Reopen", () => setStatus(s.id, "active"));
+  const open = () => post("/api/open", { id: s.id });
+  const title = el("div", { className: "title", title: "Open in VS Code", onclick: open }, highlighted(s.title));
+  add("Rename", () => {
+    const input = el("input", { className: "rename", value: s.title, placeholder: "Empty goes back to Claude's title" });
+    let finished = false;
+    const finish = async save => {
+      if (finished) return;
+      finished = true;
+      editing = false;
+      if (save && input.value.trim() !== s.title) await post("/api/rename", { id: s.id, name: input.value });
+      load();
+    };
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter") finish(true);
+      if (e.key === "Escape") finish(false);
+    });
+    input.addEventListener("blur", () => finish(true));
+    title.replaceWith(input);
+    editing = true;
+    input.focus();
+    input.select();
+  });
+  const body = el("div", { className: "body" },
+    title,
+    el("div", { className: "meta" }, highlighted(s.project), " · " + state(s)));
+  if (s.snippet) body.append(el("div", { className: "snippet" }, highlighted(s.snippet)));
+  return el("div", { className: "row" + (s.overdue ? " overdue" : "") },
+    body, el("div", { className: "idle", textContent: ago(s.idle) }), actions);
+}
+
+function section(name, sessions) {
+  const heading = el("h2", { textContent: `${name} (${sessions.length})` });
+  const rows = sessions.length ? sessions.map(row) : [el("div", { className: "empty", textContent: "None" })];
+  if (!(name in folded)) {
+    list.append(heading, ...rows);
+    return;
+  }
+  const details = el("details", { open: !folded[name] }, el("summary", {}, heading), ...rows);
+  details.addEventListener("toggle", () => { folded[name] = !details.open; });
+  list.append(details);
+}
+
+function render(data) {
+  banner.hidden = !data.errors;
+  banner.textContent = "The tracker logged errors: see ~/.claude/tracker/errors.log, then delete it.";
+  list.replaceChildren();
+  const all = data.sessions;
+  const needs = all.filter(s => s.needs_you);
+  document.title = (needs.length ? `(${needs.length}) ` : "") + "Claude chats";
+  if (words.length) {
+    section("Results", all);
+    return;
+  }
+  section("Needs you", needs);
+  section("Claude working", all.filter(s => s.status === "active" && !s.needs_you));
+  section("Acknowledged", all.filter(s => s.status === "acked"));
+  section("Done", all.filter(s => s.status === "done"));
+}
+
+async function load() {
+  if (editing) return;
+  const query = q.value.trim();
+  try {
+    const res = await fetch("/api/sessions?q=" + encodeURIComponent(query));
+    const data = await res.json();
+    if (query !== q.value.trim()) return;  // a newer search is on its way
+    words = query.split(/\s+/).filter(Boolean);
+    render(data);
+  } catch (err) {
+    banner.hidden = false;
+    banner.textContent = "Can't reach the tracker server: " + err.message;
+  }
+}
+
+q.addEventListener("input", () => {
+  clearTimeout(typing);
+  typing = setTimeout(load, 200);
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "/" && !(document.activeElement instanceof HTMLInputElement)) {
+    e.preventDefault();
+    q.focus();
+  }
+});
+setInterval(load, 10000);
+load();
+</script>
+</body>
+</html>
